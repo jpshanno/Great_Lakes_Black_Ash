@@ -1,0 +1,158 @@
+---
+output: 
+  pdf_document:
+    fig_caption: FALSE
+---
+# Black Ash Canopy Water Use Estimates in the Great Lakes Basin
+Joe Shannon
+`r Sys.Date()`
+```{r Set_Options, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(lme4)
+library(pander)
+library(readr)
+library(stringr)
+library(tidyr)
+
+knitr::opts_chunk$set("message" = F, 
+                      "warning" = F)
+```
+
+## Data Sources
+Species level maps for both the United States and Canada are available as 250 m^2^ resolution rasters, estimated using nearest neighbor analysis. The US data is accessible through the US Forest Service [Wilson, et al (2013)](https://doi.org/10.2737/RDS-2013-0013), and the Canadian data is provided by National Forest Inventory, [Beaudoin, et al (2014)](https://doi.org/10.1139/cjfr-2013-0401). The Canadian data is provided in aboveground biomass (t ha^-1^), and the US data is provided in basal area (ft^2^ ac^-1^). An _F. nigra_ specific aboveground biomass equation was created by combining the equations from Parker and Schneider (1975) and Reiners (1972), taken from [GTR-NE-319](https://www.fs.fed.us/ne/global/pubs/books/dia_biomass/index.shtml). Models to estimate tree level sapwood area from diameter, stand level sapwood area from basal area, and stand level basal area from aboveground biomass, were generated using 2012 inventory data, and sapwood area measurements from the MTU black ash study.
+Sap flux rates used to calculate water use were taken from modeled data where $$Sap~Flux (ft^3ft^{-2}d^{-1}) = Species~\mathsf{x}~WL (cm)~\mathsf{x}~\sqrt{D_z (kPa)} + (1|tree/probe)$$ WL is the water level at the root collar of the tree and D~z~ is the day-length normalized vapor pressure deficit.
+
+## Conversions
+```{r Create_Conversion_Equations, echo = F, results = 'hold'}
+
+# Load_and_Convert_Sapwood_Areas
+sapwoodArea <- 
+  read_csv("../../../SapFlux/Data-Raw/Data_Sapwood_Area.csv") %>% 
+  mutate_at(.vars = vars(matches("cm$")), 
+            .funs = function(x){x/(12*2.54)}) %>% 
+  mutate_at(.vars = vars(matches("cm2$")),
+            .funs = function(x){x/(12*2.54)^2}) %>% 
+  rename_at(.vars = vars(matches("cm")),
+            .funs = funs(str_replace,
+                         .args = list(pattern = "cm",
+                                      replacement = "ft")))
+
+# Fit_DBH_to_SA_Model
+sapMod <- lm(saparea_ft2 ~ dbh_ft,
+                 data = sapwoodArea)
+
+sapwoodArea <- 
+  sapwoodArea %>% 
+  mutate(fittedValues = predict(sapMod))
+
+plotTreeSapwood <- ggplot(aes(y = saparea_ft2,
+           x = dbh_ft), 
+       data = sapwoodArea) +
+  geom_point() +
+  geom_line(aes(y = fittedValues),
+            col = "blue") +
+  theme_classic() +
+  ggtitle("Individual Tree Sapwood Area Function")
+
+# Calculate AGB (tons) from DBH (ft)
+agb <-  function(DBH.ft){.0327567356 * DBH.ft ^ 2.30399}
+
+inventory <- 
+  read_csv("../../../SapFlux/Data-Raw/Data_Overstory_2012.csv") %>% 
+  mutate(dbh_ft = dbh_cm/(12*2.54)) %>% 
+  select(-dbh_cm)
+
+stocking <- 
+  inventory %>% 
+  filter(species == "frni") %>% 
+  mutate(sapwoodArea_ft2 = as.numeric(predict(sapMod, 
+                                   newdata = .)),
+         basalArea_ft2 = pi*(dbh_ft/2)^2,
+         agb_t = agb(dbh_ft)) %>% 
+  group_by(site, plotnum) %>% 
+  summarize(trees_n_acre = n()/((pi*37.064^2)/43560),
+            dbh_ft = mean(dbh_ft),
+            basalArea_ft2_acre = sum(basalArea_ft2)/((pi*37.064^2)/43560),
+            sapwoodArea_ft2_acre = sum(sapwoodArea_ft2)/((pi*37.064^2)/43560),
+            agb_t_ha = sum(agb_t)/((pi*11.3^2)/10000))
+
+stockingMod <- 
+  lmer(basalArea_ft2_acre ~ 0 + agb_t_ha + (0 + agb_t_ha|site),
+       data = stocking)
+#fixef(stockingMod)
+
+standSapMod <- 
+  lmer(sapwoodArea_ft2_acre ~ basalArea_ft2_acre + (1|site),
+       data = stocking)
+#fixef(standSapMod)
+
+plotStandSapwood <- ggplot(aes(y = sapwoodArea_ft2_acre,
+           x = basalArea_ft2_acre), 
+       data = stocking) +
+  geom_point() +
+  geom_line(aes(y = predict(standSapMod,
+                            re.form = ~0)),
+            col = "blue") +
+  theme_classic() +
+  ggtitle("Stand Level Sapwood Area Function")
+
+plotBiomass <- ggplot(aes(y = basalArea_ft2_acre,
+           x = agb_t_ha), 
+       data = stocking) +
+  geom_point() +
+  geom_smooth(method = "lm", 
+              formula = "y ~ 0+x",
+              span = 1,
+              se = F) +
+  theme_classic() +
+  ggtitle("Stand Level Biomass Function")
+
+flux_ft3_ft2d <- 
+  read_csv("Data_Raw/Daily_Modeled_Flux.csv") %>% 
+  filter(Species == "_F. nigra_") %>% 
+  mutate(fit = fit * 3.280846) %>% 
+  pull(fit) %>% 
+  median(.)
+
+# From raster data:
+usMean_imp <- 2.5353477283154
+caMean_metric <- 0.90934728648167
+usMax_imp <- 105.3450012207
+caMax_metric <- 23.872190475464
+
+
+usMean_metric <- usMean_imp/10.31443
+usMax_metric <- usMax_imp/10.31443
+
+meansRatio <- usMean_metric/caMean_metric
+maxesRatio <- usMax_metric/caMax_metric
+
+adjustmentFactor <- mean(c(meansRatio, maxesRatio))
+
+```
+### AGB to Basal Area
+The AGB for each inventoried tree was calculated using the final compiled AGB equation. $$AGB~(t) = 0.0328 * DBH^{2.3040}(ft)$$. For each inventory plot ($n \geq 3$ per site), AGB in tons per hectare and basal area in square feet per acre were calculated and a linear mixed model was developed to predict basal area from AGB. The model used a set intercept of 0, AGB as the fixed effect, and site as the random effect. The final equation was `r paste("$$BA (ft~ac^{-1}) =", as.numeric(round(fixef(stockingMod), 4)), "*AGB(t~ha^{-1})$$")` To adjust for differences in methodology bewteen the US and Canadian data sets, AGB was adjusted prior to conversion. The adjustment factor (`r round(adjustmentFactor, digits = 4)`) was the average of the ratios of the means and the maxes between the two datasets. $$c.f. = \frac{1}{2}*\left(\frac{US Mean}{CA Mean}+\frac{US Max}{CA Max}\right)$$
+
+### Basal Area to Sapwood Area
+Sapwood area for each inventoried tree was calculated as `r paste("$$ SA (ft^2) =", round(coef(sapMod)[1], 4), "+", round(coef(sapMod)[2], 4), "*BA (ft^2)$$")` For each inventory plot ($n \geq 3$ per site) sapwood area in square feet per acre and basal area in square feet per acre were calculated and a linear mixed model was developed to predict sapwood area from basal area. The model used basal area as the fixed effect, and site as the random effect. The final equation was `r paste("$$ SA (ft^2~ac^{-1}) =", round(fixef(standSapMod)[1], 4), "+", round(fixef(standSapMod)[2], 4), "*BA (ft^2~ac^{-1})$$")`
+
+### Data Trimming
+After the Canadian data was converted to basal area, the merged data were trimmed so that any cells with basal area less than 20 ft^2^ ac^-1^ were set equal to zero. Each raster cell is ~15.5 acres, so a basal area of 20 ft^2^ ac^-1^ within a cell is equivalent to ~3.875 acres of black ash with a
+basal area of 80 ft^2^ ac^-1^, which is the average basal of our 9 study sites. This removes cell where a very low basal area was detected across the entire 15.5 acres, which is likely a result of noise from the nearest neighbor analysis. Some small stands of black ash are sure to be missed, but that is a result of the scale of the data and the isolated nature of many smaller black ash wetlands.
+
+## Water Use
+A median sap flux value of `r round(flux_ft3_ft2d, 4)` was found for modeled black ash sap flux. Multiplying this median value, by the sapwood area per acre found in each cell yields an estimate of water use per acre per day, which can be further multiplied to water use per day. These values were then summed at the Great Lakes subwatershed and lake basin scales.
+
+```{r Great_Lakes_Table, results = 'asis', echo = F}
+options(scipen=10)
+pander(
+  data.frame(`Lake Basin` = c("Erie", "Michigan", "Superior", "Ontario", "Huron", "St. Lawrence"),
+           `Water Use (ft^3^ day^-1^)` = c(930637, 6443292, 8749230, 16466057, 17997644, 28197864),
+           check.names = FALSE,
+           stringsAsFactors = F)
+)
+```
+
+![](Data_Output/Median_Water_Use.tif)
+
